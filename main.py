@@ -76,7 +76,7 @@ class Pipeline:
     def __init__(self, cfg: Config):
         self.cfg    = cfg
         self.tmp    = Path(tempfile.mkdtemp(prefix="dub_"))
-        self.device = "cuda" if cfg.usar_gpu else "cpu"
+        self.device = "cpu"
 
         print("=" * 60)
         print("  Dublador de Vídeo — 100% Offline")

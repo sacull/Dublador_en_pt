@@ -35,10 +35,39 @@ class Sintetizador:
         self.device = device
 
     def carregar_modelo(self) -> TTS:
-        """Carrega o modelo XTTS-v2. Na 1ª vez faz download de ~1.8 GB."""
+        """
+        Carrega o modelo XTTS-v2. Na 1ª vez faz download de ~1.8 GB.
+
+        Aplica patch de compatibilidade para PyTorch >= 2.6, que mudou o valor
+        padrao de weights_only=True em torch.load, quebrando o carregamento
+        de checkpoints do Coqui TTS que contem classes customizadas.
+        """
         print("\n[4/6] Carregando Coqui XTTS-v2…")
-        print("      (1ª execução faz download de ~1.8 GB — aguarde)")
+        print("      (1a execucao faz download de ~1.8 GB — aguarde)")
+        self._aplicar_patch_torch()
         return TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(self.device)
+
+    def _aplicar_patch_torch(self) -> None:
+        """
+        Corrige incompatibilidade entre PyTorch >= 2.6 e Coqui TTS.
+
+        O PyTorch 2.6 mudou weights_only=False para True por padrao no torch.load,
+        bloqueando globals customizados usados nos checkpoints do Coqui.
+        Este patch substitui torch.load temporariamente para forcar weights_only=False,
+        que e seguro pois o modelo XTTS-v2 vem de fonte confiavel (Hugging Face).
+        """
+        import torch
+        import functools
+
+        torch_load_original = torch.load
+
+        @functools.wraps(torch_load_original)
+        def torch_load_patch(*args, **kwargs):
+            kwargs["weights_only"] = False
+            return torch_load_original(*args, **kwargs)
+
+        torch.load = torch_load_patch
+        print("      Patch PyTorch 2.6+ aplicado (weights_only=False).")
 
     def sintetizar(self, segmentos: list[dict], modelo: TTS) -> Path:
         """
