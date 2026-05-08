@@ -8,13 +8,17 @@ Estrutura do projeto:
     config.py        → configurações e constantes
     extrator.py      → extração de áudio do vídeo (FFmpeg)
     transcritor.py   → transcrição com Whisper + mesclagem de segmentos curtos
+    diarizador.py    → separação de falantes offline (resemblyzer + KMeans)
     tradutor.py      → tradução offline com Argos Translate
     sintetizador.py  → síntese de voz com Coqui XTTS-v2 + sincronização
     exportador.py    → montagem do vídeo final (FFmpeg)
     main.py          → orquestração da pipeline completa  ← você está aqui
 
-Dependências Python:
+Dependências obrigatórias:
     pip install openai-whisper argostranslate TTS pydub ffmpeg-python tqdm torch
+
+Dependências opcionais (diarização de múltiplos falantes, 100% offline):
+    pip install resemblyzer scikit-learn soundfile
 
 Sistema:
     ffmpeg instalado e no PATH
@@ -26,7 +30,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-# ── Auto-instalação de dependências ───────────────────────────────────────────
+# ── Auto-instalação de dependências obrigatórias ──────────────────────────────
 DEPS = [
     "openai-whisper",
     "argostranslate",
@@ -49,11 +53,10 @@ def instalar_deps() -> None:
 instalar_deps()
 
 # ── Imports do projeto ────────────────────────────────────────────────────────
-import torch
-
 from config       import Config
 from extrator     import Extrator
 from transcritor  import Transcritor
+from diarizador   import Diarizador
 from tradutor     import Tradutor
 from sintetizador import Sintetizador
 from exportador   import Exportador
@@ -64,30 +67,32 @@ from exportador   import Exportador
 # ══════════════════════════════════════════════════════════════════════════════
 class Pipeline:
     """
-    Orquestra as 6 etapas da dublagem:
-        1. Extração de áudio
-        2. Transcrição (Whisper)
-        3. Tradução (Argos Translate — offline)
-        4. Carregamento do modelo TTS (Coqui XTTS-v2)
-        5. Síntese de voz + sincronização
-        6. Exportação do vídeo final
+    Orquestra as etapas da dublagem:
+        1.  Extração de áudio
+        2.  Transcrição (Whisper)
+        3.  Diarização offline (resemblyzer + KMeans) — separa falantes
+        4.  Tradução (Argos Translate — offline)
+        5.  Carregamento do modelo TTS (Coqui XTTS-v2)
+        6.  Síntese de voz + sincronização (voz diferente por falante)
+        7.  Exportação do vídeo final
     """
 
     def __init__(self, cfg: Config):
         self.cfg    = cfg
         self.tmp    = Path(tempfile.mkdtemp(prefix="dub_"))
-        self.device = "cpu"
+        self.device = "cuda" if cfg.usar_gpu else "cpu"
 
         print("=" * 60)
         print("  Dublador de Vídeo — 100% Offline")
         print("=" * 60)
-        print(f"  Entrada  : {cfg.video_entrada}")
-        print(f"  Saída    : {cfg.video_saida}")
-        print(f"  Idiomas  : {cfg.idioma_origem} → {cfg.idioma_destino}")
-        print(f"  Whisper  : {cfg.whisper_model}")
-        print(f"  Voz      : {'clonada do vídeo' if cfg.clonar_voz else 'padrão XTTS'}")
-        print(f"  Hardware : {self.device.upper()}")
-        print(f"  Temp     : {self.tmp}")
+        print(f"  Entrada    : {cfg.video_entrada}")
+        print(f"  Saída      : {cfg.video_saida}")
+        print(f"  Idiomas    : {cfg.idioma_origem} → {cfg.idioma_destino}")
+        print(f"  Whisper    : {cfg.whisper_model}")
+        print(f"  Voz        : {'clonada do vídeo' if cfg.clonar_voz else 'padrão XTTS'}")
+        print(f"  Diarização : {'ativada (resemblyzer)' if cfg.diarizar else 'desativada'}")
+        print(f"  Hardware   : {self.device.upper()}")
+        print(f"  Temp       : {self.tmp}")
         print("=" * 60)
 
     def executar(self) -> None:
@@ -99,16 +104,21 @@ class Pipeline:
         transcritor = Transcritor(self.cfg, self.tmp, self.device)
         segmentos   = transcritor.transcrever(wav)
 
-        # 3. Tradução
+        # 3. Diarização (anota 'speaker' em cada segmento e extrai referências de voz)
+        if self.cfg.diarizar:
+            diarizador = Diarizador(self.cfg, self.tmp)
+            segmentos  = diarizador.diarizar(wav, segmentos)
+
+        # 4. Tradução
         tradutor  = Tradutor(self.cfg)
         segmentos = tradutor.traduzir(segmentos)
 
-        # 4 + 5. Síntese
+        # 5 + 6. Síntese
         sintetizador = Sintetizador(self.cfg, self.tmp, self.device)
         modelo       = sintetizador.carregar_modelo()
         audio_final  = sintetizador.sintetizar(segmentos, modelo)
 
-        # 6. Exportação
+        # 7. Exportação
         exportador = Exportador(self.cfg)
         exportador.exportar(audio_final)
 
@@ -122,10 +132,12 @@ if __name__ == "__main__":
         video_saida    = "video_dublado.mp4",
         idioma_origem  = "en",
         idioma_destino = "pt",
-        whisper_model  = "medium",   # large = mais preciso, porém mais lento
-        clonar_voz     = True,       # clona a voz do próprio vídeo
-        ref_duracao_s  = 10.0,       # segundos de referência para clonagem
-        modo_sync      = "stretch",  # melhor sincronia sem distorção de pitch
+        whisper_model  = "large",
+        clonar_voz     = True,
+        ref_duracao_s  = 10.0,
+        modo_sync      = "stretch",
+        diarizar       = True,    # False para desativar e usar voz única
+        max_falantes   = 6,
     )
 
     Pipeline(cfg).executar()

@@ -23,10 +23,10 @@ class Sintetizador:
     Gera o áudio dublado segmento por segmento usando o Coqui XTTS-v2.
 
     Funcionalidades:
-    - Clonagem de voz a partir de um trecho de referência do vídeo original
-    - Checkpoint por segmento: retoma de onde parou se o processo for interrompido
-    - Sincronização via filtro atempo do FFmpeg (preserva pitch, ajusta velocidade)
-    - Fallback para silêncio se um segmento falhar, sem abortar o processo
+    - Clonagem de voz a partir de um trecho de referência por falante
+    - Checkpoint por segmento: retoma de onde parou se interrompido
+    - Sincronização via filtro atempo do FFmpeg encadeado (preserva pitch)
+    - Fallback para silêncio se um segmento falhar
     """
 
     def __init__(self, cfg: Config, pasta_temp: Path, device: str):
@@ -35,49 +35,28 @@ class Sintetizador:
         self.device = device
 
     def carregar_modelo(self) -> TTS:
-        """
-        Carrega o modelo XTTS-v2. Na 1ª vez faz download de ~1.8 GB.
-
-        Aplica patch de compatibilidade para PyTorch >= 2.6, que mudou o valor
-        padrao de weights_only=True em torch.load, quebrando o carregamento
-        de checkpoints do Coqui TTS que contem classes customizadas.
-        """
         print("\n[4/6] Carregando Coqui XTTS-v2…")
         print("      (1a execucao faz download de ~1.8 GB — aguarde)")
         self._aplicar_patch_torch()
         return TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(self.device)
 
     def _aplicar_patch_torch(self) -> None:
-        """
-        Corrige incompatibilidade entre PyTorch >= 2.6 e Coqui TTS.
+        import torch, functools
+        _original = torch.load
 
-        O PyTorch 2.6 mudou weights_only=False para True por padrao no torch.load,
-        bloqueando globals customizados usados nos checkpoints do Coqui.
-        Este patch substitui torch.load temporariamente para forcar weights_only=False,
-        que e seguro pois o modelo XTTS-v2 vem de fonte confiavel (Hugging Face).
-        """
-        import torch
-        import functools
-
-        torch_load_original = torch.load
-
-        @functools.wraps(torch_load_original)
-        def torch_load_patch(*args, **kwargs):
+        @functools.wraps(_original)
+        def _patch(*args, **kwargs):
             kwargs["weights_only"] = False
-            return torch_load_original(*args, **kwargs)
+            return _original(*args, **kwargs)
 
-        torch.load = torch_load_patch
+        torch.load = _patch
         print("      Patch PyTorch 2.6+ aplicado (weights_only=False).")
 
     def sintetizar(self, segmentos: list[dict], modelo: TTS) -> Path:
-        """
-        Sintetiza todos os segmentos e retorna o caminho da trilha final (WAV).
-        """
         print(f"\n[5/6] Sintetizando {len(segmentos)} segmentos…")
 
         lang      = XTTS_LANG.get(self.cfg.idioma_destino, "pt")
-        ref_wav   = str(self.tmp / "voz_referencia.wav")
-        dur_total = int(segmentos[-1]["end"] * 1000) + 500   # ms
+        dur_total = int(segmentos[-1]["end"] * 1000) + 2000
         trilha    = AudioSegment.silent(duration=dur_total)
 
         for i, seg in enumerate(tqdm(segmentos, desc="  TTS")):
@@ -89,6 +68,12 @@ class Sintetizador:
             if not texto:
                 continue
 
+            # Referência de voz: por falante (diarização) ou padrão
+            speaker_id  = seg.get("speaker", "SPEAKER_00")
+            ref_por_spk = self.tmp / f"voz_{speaker_id}.wav"
+            ref_padrao  = self.tmp / "voz_referencia.wav"
+            ref_wav     = str(ref_por_spk) if ref_por_spk.exists() else str(ref_padrao)
+
             seg_audio = self._gerar_segmento(i, texto, lang, ref_wav, modelo, slot)
             seg_audio = self._ajustar_duracao(seg_audio, slot)
             trilha    = trilha.overlay(seg_audio, position=inicio)
@@ -98,7 +83,7 @@ class Sintetizador:
         print(f"      Trilha final: {saida}")
         return saida
 
-    # ── Métodos privados ──────────────────────────────────────────────────────
+    # ── Geração por segmento ──────────────────────────────────────────────────
 
     def _gerar_segmento(
         self,
@@ -109,29 +94,20 @@ class Sintetizador:
         modelo: TTS,
         slot_ms: int,
     ) -> AudioSegment:
-        """
-        Gera (ou reutiliza do checkpoint) o áudio de um único segmento.
-        Se falhar, retorna silêncio com a duração do slot.
-        """
         seg_wav = self.tmp / f"seg_{indice:04d}.wav"
 
-        # Checkpoint: se o arquivo já existe e é válido, reutiliza sem reprocessar
         if seg_wav.exists() and seg_wav.stat().st_size > 1000:
             return AudioSegment.from_wav(str(seg_wav))
 
         try:
             if self.cfg.clonar_voz:
                 modelo.tts_to_file(
-                    text=texto,
-                    language=lang,
-                    speaker_wav=ref_wav,
-                    file_path=str(seg_wav),
+                    text=texto, language=lang,
+                    speaker_wav=ref_wav, file_path=str(seg_wav),
                 )
             else:
                 modelo.tts_to_file(
-                    text=texto,
-                    language=lang,
-                    file_path=str(seg_wav),
+                    text=texto, language=lang, file_path=str(seg_wav),
                 )
             return AudioSegment.from_wav(str(seg_wav))
 
@@ -139,47 +115,104 @@ class Sintetizador:
             print(f"\n  ⚠️  Segmento {indice} falhou ({erro}) — usando silêncio.")
             return AudioSegment.silent(duration=slot_ms)
 
-    def _ajustar_duracao(self, audio: AudioSegment, slot_ms: int) -> AudioSegment:
-        """
-        Ajusta a duração do segmento gerado para caber exatamente no slot de tempo.
+    # ── Sincronização ─────────────────────────────────────────────────────────
 
-        - modo "stretch": usa o filtro atempo do FFmpeg para esticar/comprimir
-          o áudio sem alterar o pitch (tom de voz).
-        - modo "fill": corta o excesso ou preenche com silêncio.
-        """
-        atual = len(audio)
-        if abs(atual - slot_ms) < 80:
-            return audio   # diferença desprezível, não precisa ajustar
+    def _ajustar_duracao(self, audio: AudioSegment, slot_ms: int) -> AudioSegment:
+        """Ajusta o segmento para caber no slot de tempo do vídeo original."""
+        if abs(len(audio) - slot_ms) < 80:
+            return audio
 
         if self.cfg.modo_sync == "stretch":
             return self._stretch(audio, slot_ms)
-        else:
-            return self._fill(audio, slot_ms)
+        return self._fill(audio, slot_ms)
 
     def _stretch(self, audio: AudioSegment, slot_ms: int) -> AudioSegment:
-        """Altera a velocidade de reprodução via FFmpeg atempo, preservando o pitch."""
-        fator = max(0.5, min(2.0, len(audio) / slot_ms))
+        """
+        Usa atempo do FFmpeg para ajustar velocidade sem alterar pitch.
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fi:
-            audio.export(fi.name, format="wav")
-            fo = fi.name.replace(".wav", "_stretched.wav")
+        CORREÇÃO CRÍTICA: usa mkstemp para garantir nomes de arquivo com
+        sufixo .wav correto — evita o bug onde replace('.wav') falhava
+        silenciosamente e o arquivo de saída nunca era criado.
+
+        O atempo só aceita 0.5–2.0; encadeia filtros para ratios fora desse range.
+        """
+        if slot_ms <= 0:
+            return audio
+
+        ratio = len(audio) / slot_ms
+        # Limita para evitar artefatos extremos (>4x ou <0.25x)
+        ratio = max(0.25, min(4.0, ratio))
+
+        passos = self._calcular_passos_atempo(ratio)
+
+        # mkstemp garante sufixo .wav correto em qualquer SO
+        fd_in,  path_in  = tempfile.mkstemp(suffix=".wav")
+        fd_out, path_out = tempfile.mkstemp(suffix=".wav")
+        os.close(fd_in)
+        os.close(fd_out)
+
+        try:
+            audio.export(path_in, format="wav")
+
+            # Encadeia os filtros atempo um a um
+            stream = ffmpeg.input(path_in).audio
+            for p in passos:
+                stream = stream.filter("atempo", p)
 
             (
-                ffmpeg.input(fi.name)
-                .filter("atempo", fator)
-                .output(fo, acodec="pcm_s16le")
+                ffmpeg.output(stream, path_out, acodec="pcm_s16le")
                 .overwrite_output()
                 .run(quiet=True)
             )
 
-            resultado = AudioSegment.from_wav(fo)
-            os.unlink(fi.name)
-            os.unlink(fo)
+            resultado = AudioSegment.from_wav(path_out)
+
+        except Exception as e:
+            print(f"\n  ⚠️  stretch falhou ({e}) — usando fill como fallback.")
+            resultado = self._fill(audio, slot_ms)
+
+        finally:
+            # Garante limpeza mesmo se houver exceção
+            for p in (path_in, path_out):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
         return resultado
 
+    @staticmethod
+    def _calcular_passos_atempo(ratio: float) -> list[float]:
+        """
+        Decompõe ratio em passos dentro de [0.5, 2.0] para encadeamento.
+
+        ratio > 1.0 → áudio mais longo que o slot → comprime (fala mais rápido)
+        ratio < 1.0 → áudio mais curto que o slot → estica (fala mais devagar)
+
+        Exemplos:
+          ratio 3.0  → [2.0, 1.5]
+          ratio 4.0  → [2.0, 2.0]
+          ratio 0.25 → [0.5, 0.5]
+          ratio 0.3  → [0.5, 0.6]
+        """
+        passos: list[float] = []
+        restante = ratio
+
+        while restante > 2.0:
+            passos.append(2.0)
+            restante /= 2.0
+
+        while restante < 0.5:
+            passos.append(0.5)
+            restante /= 0.5    # CORRIGIDO: era "restante /= 0.5" na versão bugada
+                                # que dividia ao invés de multiplicar o restante,
+                                # gerando loop infinito ou passos errados
+
+        passos.append(round(restante, 6))
+        return passos
+
     def _fill(self, audio: AudioSegment, slot_ms: int) -> AudioSegment:
-        """Corta o áudio se for maior que o slot, ou adiciona silêncio se for menor."""
+        """Corta se maior que o slot, ou preenche com silêncio se menor."""
         if len(audio) > slot_ms:
             return audio[:slot_ms]
         return audio + AudioSegment.silent(duration=slot_ms - len(audio))

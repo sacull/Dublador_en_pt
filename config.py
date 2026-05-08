@@ -33,12 +33,11 @@ class Config:
     video_saida:   str  = "video_dublado.mp4"
 
     # ── Idiomas ───────────────────────────────────────────────────────────────
-    # Códigos Argos: en, es, fr, de, it, ja, zh, ru, pl, nl, ar, ko, pt…
     idioma_origem:  str = "en"
-    idioma_destino: str = "pt"   # pt = português (Argos não diferencia BR/PT)
+    idioma_destino: str = "pt"
 
     # ── Whisper ───────────────────────────────────────────────────────────────
-    # tiny (rápido) | small | medium (recomendado) | large (mais preciso, lento)
+    # tiny | small | medium (recomendado) | large (mais preciso, lento)
     whisper_model: str  = "medium"
 
     # ── Coqui XTTS-v2 ─────────────────────────────────────────────────────────
@@ -46,9 +45,19 @@ class Config:
     # False → usa voz padrão multilíngue do XTTS
     clonar_voz:    bool  = True
 
-    # Duração do trecho inicial usado como referência de clonagem (mínimo 3s).
-    # Aumente para 15–20s se o início do vídeo tiver ruído ou música.
+    # Duração do trecho inicial usado como referência de fallback (mínimo 3s).
+    # Usado apenas se a diarização não estiver disponível.
     ref_duracao_s: float = 10.0
+
+    # ── Diarização de falantes (100% offline) ─────────────────────────────────
+    # True  → usa resemblyzer + KMeans para identificar e separar falantes
+    # False → usa a mesma voz de referência para todos os segmentos
+    # Requer: pip install resemblyzer scikit-learn soundfile
+    diarizar:      bool  = True
+
+    # Número máximo de falantes esperados no vídeo.
+    # O algoritmo estima automaticamente; este é o teto.
+    max_falantes:  int   = 6
 
     # ── Sincronização ─────────────────────────────────────────────────────────
     # "stretch" → ajusta velocidade do áudio (sem alterar pitch) para caber no slot
@@ -56,15 +65,13 @@ class Config:
     modo_sync:     str   = "stretch"
 
     # Segmentos com duração < min_seg_s são mesclados ao próximo.
-    # O XTTS gera áudio ruim para frases muito curtas (1–2 palavras).
     min_seg_s:     float = 1.5
 
     # ── Hardware ──────────────────────────────────────────────────────────────
-    # auto-detecta GPU NVIDIA; force False para rodar só em CPU
     usar_gpu:      bool  = torch.cuda.is_available()
 
     # ── Exportação ────────────────────────────────────────────────────────────
     video_codec:   str = "libx264"
     audio_codec:   str = "aac"
     audio_bitrate: str = "192k"
-    crf:           int = 18    # 0=sem perda · 18=alta qualidade · 28=menor arquivo
+    crf:           int = 18
